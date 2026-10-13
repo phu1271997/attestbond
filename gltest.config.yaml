@@ -1,0 +1,22 @@
+# gltest network configuration.
+#
+#   source ~/.genlayer/env.sh      # exports GENLAYER_PRIVATE_KEY[_2.._4]
+#   gltest --network studionet tests/
+#
+# Keys are read from the shell environment (never committed). studionet is the
+# Studio-hosted network (chain 61999); its simulator exposes sim_fundAccount and
+# sim_installMocks, so the suite funds fresh accounts and pins deterministic
+# LLM / web responses for every non-deterministic path.
+networks:
+  default: studionet
+  studionet:
+    accounts:
+      - ${GENLAYER_PRIVATE_KEY}
+      - ${GENLAYER_PRIVATE_KEY_2}
+      - ${GENLAYER_PRIVATE_KEY_3}
+      - ${GENLAYER_PRIVATE_KEY_4}
+    from: ${GENLAYER_PRIVATE_KEY}
+    default_wait_interval: 5000
+    default_wait_retries: 200
+paths:
+  contracts: contracts
