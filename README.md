@@ -146,8 +146,9 @@ gltest tests/test_attestbond.py -v          # 21 deterministic tests, offline
 
 **(2) StudioNet end-to-end suite** (`tests/test_studionet_e2e.py`) deploys the
 real contract to the live Studio network and drives it over JSON-RPC through
-validator consensus. Every write is asserted to reach **FINALIZED with a GenVM
-`execution_result` of SUCCESS** — never merely ACCEPTED. The hosted RPC does not
+validator consensus. Every write is waited to **ACCEPTED** and then asserted to
+have a GenVM **`execution_result` of SUCCESS** — inclusion alone is never treated
+as proof the code ran. The hosted RPC does not
 expose `sim_installMocks`, so verdicts are produced by the **live LLM jury
 reading real public sources** (a true python.org fact → SUPPORTED, a false one →
 REFUTED, a dead link → INCONCLUSIVE); no-LLM paths use a REJECTED filing's

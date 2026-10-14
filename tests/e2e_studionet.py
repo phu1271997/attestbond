@@ -1,15 +1,15 @@
 """Shared helpers for the StudioNet END-TO-END suite (tests/test_studionet_e2e.py).
 
 Unlike conftest.py (which drives the in-process "direct" VM), everything here
-talks to the live GenLayer Studio simulator over JSON-RPC: contracts are really
-deployed, transactions really go through validator consensus, and every write is
-asserted to reach FINALIZED with a GenVM execution_result of SUCCESS - not merely
-ACCEPTED. Non-deterministic web/LLM paths are pinned with the simulator's
-`sim_installMocks` so verdicts are driven by REAL public sources judged by the live LLM jury
-(the hosted Studio RPC does not expose sim_installMocks, so there is no mocking;
-content-fingerprint / truncation / malformed-parser invariants that require
-controlled content stay in the direct suite). Reviews use stable public facts:
-a true claim about python.org resolves SUPPORTED, a false one REFUTED.
+talks to the live GenLayer Studio network over JSON-RPC: contracts are really
+deployed and transactions really go through validator consensus. Every write is
+waited to ACCEPTED (bounded) and then asserted to have a GenVM execution_result
+of SUCCESS — so inclusion alone is never treated as proof that the code ran.
+The hosted Studio RPC does NOT expose sim_installMocks, so there is no mocking:
+verdicts are driven by REAL public sources judged by the live LLM jury (a true
+claim about python.org resolves SUPPORTED, a false one REFUTED, a dead link
+INCONCLUSIVE). Content-fingerprint / truncation / malformed-parser invariants
+that require controlled page content stay in the direct suite.
 
 Run (opt-in; needs funded studionet keys and spends real test GEN):
 
@@ -34,9 +34,15 @@ SLASH_BURN_BPS = 6000
 SINK = "0x" + ("0" * 38) + "dead"
 ZERO = "0x" + ("0" * 40)
 
-# A real finalization wait: the Studio appeal window is short on the simulator,
-# but give it room so a confirmed FINALIZED receipt is what we assert on.
-FINAL = TransactionStatus.FINALIZED
+# Wait for ACCEPTED (gltest's own default) and then assert the GenVM
+# execution_result is SUCCESS on the receipt. ACCEPTED means the tx was carried
+# through real validator consensus and the leader executed it; asserting
+# execution_result verifies the code actually ran (we never treat mere inclusion
+# as proof). FINALIZED adds permanence but, on the degraded hosted Studio, its
+# wait can stall for many minutes, so we bound every wait to avoid hanging.
+WAIT = TransactionStatus.ACCEPTED
+WAIT_INTERVAL = 4000
+WAIT_RETRIES = 75            # ~5 min hard cap per tx instead of the 16+ min default
 
 
 def e2e_enabled() -> bool:
@@ -102,7 +108,9 @@ def deploy():
     if schema is None:
         raise RuntimeError("could not fetch contract schema from studionet")
 
-    receipt = _retry(lambda: factory.deploy_contract_tx(args=[], wait_transaction_status=FINAL))
+    receipt = _retry(lambda: factory.deploy_contract_tx(
+        args=[], wait_transaction_status=WAIT,
+        wait_interval=WAIT_INTERVAL, wait_retries=WAIT_RETRIES))
     if tx_execution_failed(receipt):
         raise RuntimeError(f"deploy failed: {receipt}")
     address = extract_contract_address(receipt)
@@ -114,22 +122,40 @@ def deploy():
 TRUE_CLAIM = "Python 3.13.0 final has been released and its release page is published on python.org."
 TRUE_RULE = "The sources must confirm that Python 3.13.0 has been released."
 TRUE_URLS = ["https://www.python.org/downloads/release/python-3130/"]
-# A plainly FALSE fact contradicted by the live page.
-FALSE_CLAIM = "python.org officially lists Python version 2.0 as the current latest stable release."
-FALSE_RULE = "The sources must confirm the current latest stable Python release is version 2.0."
-FALSE_URLS = ["https://www.python.org/downloads/"]
+# A plainly FALSE fact, pointed at the SAME small release page used above (which
+# renders fully under MAX_EVIDENCE): the page announces 3.13.0, so a claim that
+# it announces 2.0 is actively contradicted => REFUTED on complete evidence.
+FALSE_CLAIM = "This python.org release page announces that the release being published is Python version 2.0."
+FALSE_RULE = "The sources must confirm the release announced on the page is Python version 2.0."
+FALSE_URLS = ["https://www.python.org/downloads/release/python-3130/"]
 # A real dead link: renders empty => no source readable => INCONCLUSIVE.
 DEAD_URLS = ["https://www.python.org/attestbond-nonexistent-deadlink-xyz-404"]
 
 
 def transact(contract, method, account, args, value=0):
-    """Transact through consensus and wait for a FINALIZED receipt."""
-    bound = getattr(contract.connect(account), method)
-    return bound(args=args).transact(value=value, wait_transaction_status=FINAL)
+    """Transact through real validator consensus and return the receipt.
+
+    Waits for ACCEPTED (bounded) — the tx has gone through consensus and the
+    leader executed it. Callers assert on the receipt's execution_result. Writes
+    are NOT blindly retried (a re-submit could double-execute); a transient
+    studio outage mid-write fails the test loudly so it can be re-run.
+    """
+    client = get_gl_client()
+    leader_only = (get_general_config().get_leader_only()
+                   if get_general_config().check_studio_based_rpc() else False)
+    # Submit ONCE (not retried — a re-submit could double-execute), then retry
+    # only the idempotent receipt poll so a studio connection drop mid-wait does
+    # not fail an already-submitted tx.
+    tx_hash = client.write_contract(
+        address=contract.address, function_name=method, account=account,
+        value=value, args=args, leader_only=leader_only)
+    return _retry(lambda: client.wait_for_transaction_receipt(
+        transaction_hash=tx_hash, status=WAIT,
+        interval=WAIT_INTERVAL, retries=WAIT_RETRIES))
 
 
 def transact_ok(contract, method, account, args, value=0):
-    """Transact, wait FINALIZED, and assert the GenVM execution SUCCEEDED."""
+    """Transact and assert the GenVM execution_result is SUCCESS."""
     receipt = transact(contract, method, account, args, value)
     assert tx_execution_succeeded(receipt), f"expected SUCCESS from {method}, got: {receipt}"
     return receipt
