@@ -4,7 +4,7 @@
 
 - **Live app:** https://attestbond.vercel.app
 - **Network:** GenLayer **Studionet** (chain `61999`, RPC `https://studio.genlayer.com/api`) — Explorer status is **Preview**
-- **Contract:** [`0xB06EE241f27A47B0700c3c6A1a8bf69463aFb6F5`](https://explorer-studio.genlayer.com/address/0xB06EE241f27A47B0700c3c6A1a8bf69463aFb6F5)
+- **Contract:** [`0x03e2BA90D866eB8d0f3720C8698fFb160ea6908e`](https://explorer-studio.genlayer.com/address/0x03e2BA90D866eB8d0f3720C8698fFb160ea6908e)
 
 ## The problem
 
@@ -27,7 +27,7 @@ rules — strictly under the check rule — one of:
 | Verdict | Consequence |
 |---|---|
 | `SUPPORTED` | stake returns to the **attester**; reputation **rises** (and a losing challenger's bond is awarded to the attester) |
-| `REFUTED` | if **challenged**, the stake + bond go to the independent **challenger**; if **unchallenged**, the stake is **burned** to an unspendable sink; reputation **falls** |
+| `REFUTED` | the attester's **entire stake is forfeited**. If **challenged**, a majority (`SLASH_BURN_BPS` = 60%) is **burned** and the independent challenger gets their bond back plus the 40% bounty; if **unchallenged**, the whole stake is burned. Reputation **falls** |
 | `INCONCLUSIVE` | attestation stays open, reviewable again |
 | `LAPSED` (after settle-by, unresolved) | stake returns to the attester and any challenger's bond returns to the challenger; reputation unchanged |
 
@@ -38,12 +38,21 @@ posts a **matching counter-bond** with `challenge_attestation` to bet against th
 claim. This closes the self-dealing loophole: one person can no longer sit on
 both sides and recover a forfeited stake through a second wallet.
 
-- **Refuted while challenged** → the whole stake (plus the bond back) goes to the
-  independent challenger: a real transfer of value to an adversary.
-- **Refuted while unchallenged** → the stake is **slashed to a burn sink**
-  (`0x…dead`) and can never be recovered by any wallet the attester controls.
+A refuted claim must cost the attester real value that **no wallet they control
+can recover — including the challenger wallet**. So on *every* refuted path the
+attester's entire stake is forfeited and a majority is burned:
 
-So a false claim is always costly, regardless of who triggers the review.
+- **Refuted while challenged** → `SLASH_BURN_BPS` (60%) of the stake is burned to
+  the sink (`0x…dead`); the independent challenger gets their bond back plus the
+  remaining 40% bounty. The attester recovers **none** of the stake.
+- **Refuted while unchallenged** → the whole stake is burned.
+
+This closes the resubmission loophole: if the attester secretly owns the
+challenger wallet and posts the bond themselves, they still lose the burned
+majority. Worked example (stake `S`, bond `B = S`): the self-dealer commits `2S`
+and the challenger wallet receives only `B + 0.4·S = 1.4·S` — a guaranteed net
+loss of `0.6·S`. A false claim is always costly, regardless of who triggers the
+review.
 
 ### Reputation — anti-farming
 
@@ -100,13 +109,15 @@ contract even on a later execution error).
 ## Repository layout
 
 ```
-contracts/attestbond.py    # the Intelligent Contract
-tests/                     # gltest suite (20 deterministic end-to-end tests)
-scripts/deploy.py          # studionet deploy (genlayer_py) + --check-only schema check
-scripts/seed.py            # SUPPORTED + independent-challenger REFUTED + withdrawals
-scripts/build.mjs          # inject CONTRACT_ADDRESS into the frontend at build
-frontend/                  # genlayer-js + MetaMask, dedicated routes, no backend
-gltest.config.yaml         # studionet test network config
+contracts/attestbond.py          # the Intelligent Contract
+tests/test_attestbond.py         # direct-VM suite: content-controlled invariants
+tests/test_studionet_e2e.py      # StudioNet live e2e suite (real deploys + consensus)
+tests/e2e_studionet.py           # live-network helpers (deploy, transact, mocks-free)
+scripts/deploy.py                # studionet deploy (genlayer_py) + --check-only schema check
+scripts/seed.py                  # SUPPORTED + independent-challenger REFUTED + withdrawals
+scripts/build.mjs                # inject CONTRACT_ADDRESS into the frontend at build
+frontend/                        # genlayer-js + MetaMask, dedicated routes, no backend
+gltest.config.yaml               # studionet test network config
 ```
 
 ## Deploy to Studionet
@@ -121,19 +132,37 @@ Put the printed address in `.env` as `CONTRACT_ADDRESS=0x…`.
 
 ## Test
 
-The suite runs the real contract bytecode in gltest's in-process VM with
-Foundry-style cheatcodes, pinning deterministic web/LLM responses so every path
-— including the non-deterministic judgment — is exercised reproducibly. It covers
-independent-challenger participation, supported/refuted/inconclusive verdicts,
-expired (lapsed) attestations, reputation-farming attempts, malformed model
-responses, adversarial/incomplete/truncated evidence, evidence-fingerprint
-consensus, challenger withdrawals, credited recipient balances, and failed /
-over-sized payment recovery.
+Two suites. **(1) Direct-VM suite** (`tests/test_attestbond.py`) runs the real
+contract bytecode in gltest's in-process VM with Foundry-style cheatcodes,
+pinning deterministic web/LLM responses so the content-controlled invariants are
+exercised reproducibly: strict-verdict parsing, malformed-model handling,
+truncated/empty/adversarial evidence gates, evidence-fingerprint consensus, and
+the self-dealing economics.
 
 ```bash
 source ~/.genlayer/env.sh
-gltest tests/ -v                            # 20 tests
+gltest tests/test_attestbond.py -v          # 21 deterministic tests, offline
 ```
+
+**(2) StudioNet end-to-end suite** (`tests/test_studionet_e2e.py`) deploys the
+real contract to the live Studio network and drives it over JSON-RPC through
+validator consensus. Every write is asserted to reach **FINALIZED with a GenVM
+`execution_result` of SUCCESS** — never merely ACCEPTED. The hosted RPC does not
+expose `sim_installMocks`, so verdicts are produced by the **live LLM jury
+reading real public sources** (a true python.org fact → SUPPORTED, a false one →
+REFUTED, a dead link → INCONCLUSIVE); no-LLM paths use a REJECTED filing's
+withdrawable credit. It covers independent-challenger participation,
+supported/refuted/inconclusive judgments, the self-dealing challenge, expired
+(lapsed) attestations, reputation farming, challenger withdrawals, credited
+recipient-wallet delivery, and failed/ambiguous payment recovery.
+
+```bash
+source ~/.genlayer/env.sh                   # needs 3+ funded studionet keys
+RUN_STUDIONET_E2E=1 gltest --network studionet tests/test_studionet_e2e.py -v
+```
+
+It is opt-in (`RUN_STUDIONET_E2E=1`) because it spends real test GEN and takes
+several minutes of live consensus.
 
 ## Run the frontend
 

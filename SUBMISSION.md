@@ -96,9 +96,9 @@ If something goes wrong:
 Open the board/Explorer without a wallet. #0 reads SUPPORTED (confidence 99): the stake returned to the attester and was withdrawn. #2 reads REFUTED (confidence 95) after an independent wallet posted a matching bond; the stake + bond (0.002 GEN) were credited to that challenger and withdrawn, and the attester recovered nothing. #1 is an honest INCONCLUSIVE: its source could not be rendered on-chain, so the complete-evidence gate kept it open rather than concluding. The Reputation tab shows the attester folded from a neutral 50 to 41 (1 supported, 1 refuted). Verdicts, confidence and reputation come from validator consensus reading live sources, not the website.
 
 ## Contract link
-https://explorer-studio.genlayer.com/address/0xB06EE241f27A47B0700c3c6A1a8bf69463aFb6F5
+https://explorer-studio.genlayer.com/address/0x03e2BA90D866eB8d0f3720C8698fFb160ea6908e
 
-Address: `0xB06EE241f27A47B0700c3c6A1a8bf69463aFb6F5`
+Address: `0x03e2BA90D866eB8d0f3720C8698fFb160ea6908e`
 Network: GenLayer Studionet (chain 61999)
 Status: **Preview** (Studio-hosted)
 Verified: deployed and seeded by the project wallet; a SUPPORTED claim, an

@@ -59,7 +59,10 @@ def test_supported_over_a_challenge_pays_the_defender_and_scores_higher(direct_v
 
 # ----------------------------------------------------------- refuted judgments
 
-def test_refuted_with_independent_challenger_pays_the_challenger(direct_vm, direct_deploy):
+def test_refuted_with_independent_challenger_burns_majority_and_pays_bounty(direct_vm, direct_deploy):
+    # The attester's entire stake is forfeited. A majority (SLASH_BURN_BPS=60%)
+    # is burned; the challenger gets their bond back plus the 40% bounty. The
+    # attester recovers nothing, so owning the challenger wallet is a net loss.
     vm = direct_vm
     a = create_address("alice"); b = create_address("bob")
     c = direct_deploy(CONTRACT)
@@ -68,12 +71,35 @@ def test_refuted_with_independent_challenger_pays_the_challenger(direct_vm, dire
     c.challenge_attestation(aid); vm.value = 0
     mock_refute(vm)
     assert review_as(c, vm, b, aid) == "REFUTED"
+    burn = STAKE * 6000 // 10000
+    bounty = STAKE - burn
     r = att(c, aid)
     assert r["recipient"] == hx(b)
-    assert int(r["payout"]) == STAKE * 2           # challenger made whole + takes stake
-    assert credit(c, b) == STAKE * 2
+    assert int(r["payout"]) == STAKE + bounty       # own bond back + minority bounty
+    assert int(r["slashed"]) == burn                # majority permanently burned
+    assert credit(c, b) == STAKE + bounty
     assert credit(c, a) == 0                        # attester recovers nothing
+    assert int(json.loads(c.get_config())["total_burned"]) == burn
     assert rep(c, a)["refuted"] == 1
+
+
+def test_self_dealing_challenge_is_a_guaranteed_net_loss(direct_vm, direct_deploy):
+    # The feedback loophole: the attester posts the challenge bond from a second
+    # wallet they control, then gets the claim refuted to recover the stake.
+    # Model both wallets as the same economic actor: total in = stake + bond,
+    # total back = the challenger payout. The burned majority is unrecoverable.
+    vm = direct_vm
+    a = create_address("alice"); sock = create_address("alice-sockpuppet")
+    c = direct_deploy(CONTRACT)
+    aid = file_claim(c, vm, a, "False claim the attester wants to unwind.", ["https://ex.com/sock"])
+    vm.sender = sock; vm.origin = sock; vm.value = STAKE   # bond = stake
+    c.challenge_attestation(aid); vm.value = 0
+    mock_refute(vm)
+    assert review_as(c, vm, sock, aid) == "REFUTED"
+    committed = STAKE + STAKE                              # stake + bond, one actor
+    recovered = credit(c, a) + credit(c, sock)            # everything both wallets can pull
+    assert recovered < committed                           # strictly unprofitable
+    assert committed - recovered == STAKE * 6000 // 10000  # exactly the burned majority
 
 
 def test_refuted_without_a_challenger_is_slashed_to_the_burn_sink(direct_vm, direct_deploy):

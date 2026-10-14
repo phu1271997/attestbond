@@ -1,6 +1,6 @@
 // Injected at build time by scripts/build.mjs from .env / Vercel env.
 // Do not hardcode secrets here — this file ships to the browser.
-export const CONTRACT_ADDRESS = "0xB06EE241f27A47B0700c3c6A1a8bf69463aFb6F5";
+export const CONTRACT_ADDRESS = "0x03e2BA90D866eB8d0f3720C8698fFb160ea6908e";
 export const NETWORK = {
   id: 61999,
   hexId: "0xf22f",

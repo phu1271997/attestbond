@@ -4,9 +4,11 @@
 #   gltest --network studionet tests/
 #
 # Keys are read from the shell environment (never committed). studionet is the
-# Studio-hosted network (chain 61999); its simulator exposes sim_fundAccount and
-# sim_installMocks, so the suite funds fresh accounts and pins deterministic
-# LLM / web responses for every non-deterministic path.
+# Studio-hosted network (chain 61999). The hosted RPC does NOT expose
+# sim_installMocks / sim_fundAccount, so the StudioNet e2e suite uses the four
+# pre-funded keys below and drives verdicts with real public sources judged by
+# the live LLM jury. Deterministic, content-controlled invariants run in the
+# in-process direct VM (tests/test_attestbond.py).
 networks:
   default: studionet
   studionet:

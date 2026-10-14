@@ -54,31 +54,42 @@ function leaderReceipt(rcpt) {
   if (Array.isArray(lr)) lr = lr[0];
   return lr || null;
 }
+// Throws a tagged error (.genvm === true) when a receipt proves the GenVM did
+// NOT run successfully, so callers can tell a real execution failure apart from
+// a slow/timed-out wait.
+function execError(msg) { const e = new Error(String(msg)); e.genvm = true; return e; }
 function assertExecuted(rcpt) {
   const lr = leaderReceipt(rcpt);
   if (!lr || lr.execution_result !== "SUCCESS") {
-    const msg = (lr && (lr.error || (lr.result && lr.result.payload))) || "GenVM execution did not succeed";
-    throw new Error(String(msg));
+    throw execError((lr && (lr.error || (lr.result && lr.result.payload))) || "GenVM execution did not succeed");
   }
   const st = lr.result && lr.result.status;
-  if (st && st !== "return") throw new Error(`GenVM returned ${st}: ${(lr.result && lr.result.payload) || ""}`);
+  if (st && st !== "return") throw execError(`GenVM returned ${st}: ${(lr.result && lr.result.payload) || ""}`);
   return rcpt;
 }
 
-// Full send: sign → wait ACCEPTED → verify GenVM execution → wait FINALIZED.
-// We never treat ACCEPTED alone as success; we confirm the execution result and
-// then wait for on-chain finalization (best-effort on the finalization wait so
-// a long appeal window does not hang the UI after execution is already proven).
+// Full send: sign → wait ACCEPTED → verify GenVM execution → wait FINALIZED →
+// verify the FINALIZED receipt ALSO succeeded. We never treat ACCEPTED alone as
+// success. A finalized receipt that reverted (or any other proven execution
+// failure) is rethrown as an error. A finalization wait that merely times out
+// is reported as finalized:false (pending) — it is NOT reported as success.
 async function send(st, busyMsg, fn, args, value = 0n) {
   setStatus(st, "busy", "Awaiting signature in your wallet…");
   const hash = await write(fn, args, value);
   setStatus(st, "busy", busyMsg, hash);
   const accepted = await waitFor(hash, TransactionStatus.ACCEPTED);
   assertExecuted(accepted);
-  setStatus(st, "busy", "Executed. Finalizing on GenLayer…", hash);
-  try { await waitFor(hash, TransactionStatus.FINALIZED); }
-  catch { /* execution already verified; finalization can trail */ }
-  return { hash, receipt: accepted };
+  setStatus(st, "busy", "Executed. Confirming finalization on GenLayer…", hash);
+  let finalized = false;
+  try {
+    const fin = await waitFor(hash, TransactionStatus.FINALIZED);
+    assertExecuted(fin);          // finalized receipt must also be SUCCESS
+    finalized = true;
+  } catch (e) {
+    if (e && e.genvm) throw e;    // a proven finalization failure surfaces as an error
+    finalized = false;            // timed out: executed but finalization still pending
+  }
+  return { hash, receipt: accepted, finalized };
 }
 
 // -------------------------------------------------------------------- wallet
@@ -132,6 +143,7 @@ function setStatus(el, kind, msg, hash) {
   const link = hash ? ` <a href="${txUrl(hash)}" target="_blank" rel="noopener">view tx ↗</a>` : "";
   if (kind === "busy") el.innerHTML = `<span class="spinner"></span><span>${esc(msg)}</span>`;
   else if (kind === "err") el.innerHTML = `<span class="err">✗ ${esc(msg)}</span>`;
+  else if (kind === "warn") el.innerHTML = `<span class="warn">⚠ ${esc(msg)}</span>${link}`;
   else el.innerHTML = `<span class="good">✓ ${esc(msg)}</span>${link}`;
 }
 function payoutWho(a) {
@@ -230,7 +242,7 @@ async function resolvedRow(a) {
     <div class="hd"><a class="title" href="/claim?id=${a.id}">#${a.id} · ${esc(a.claim.slice(0, 70))}${a.claim.length > 70 ? "…" : ""}</a>
       <span>${badge(a.status)} ${a.verdict !== "NONE" ? `<span class="pill">${a.confidence}%</span>` : ""}</span></div>
     ${a.reason ? `<div class="reason" style="margin:10px 0">${esc(a.reason)}</div>` : ""}
-    <div class="meta">payout ${genFmt(a.payout || a.stake)} → ${payoutWho(a)}${isSink(a.recipient) ? "" : " " + short(a.recipient)} · attester reputation ${repTxt} · resolved ${whenTs(a.resolved_at)} · <a href="/claim?id=${a.id}">details →</a></div>
+    <div class="meta">payout ${genFmt(isSink(a.recipient) ? a.slashed : (a.payout || a.stake))} → ${payoutWho(a)}${isSink(a.recipient) ? "" : " " + short(a.recipient)}${!isSink(a.recipient) && BigInt(a.slashed || 0) > 0n ? ` · burned ${genFmt(a.slashed)}` : ""} · attester reputation ${repTxt} · resolved ${whenTs(a.resolved_at)} · <a href="/claim?id=${a.id}">details →</a></div>
   </div>`;
 }
 
@@ -269,13 +281,14 @@ async function submitAttestation() {
     if (!Number.isFinite(settleby)) throw new Error("Pick a settle-by time.");
     const stake = BigInt(Math.round(parseFloat($("#stake").value) * 1e18));
     if (stake < 5n * 10n ** 14n) throw new Error("Stake must be at least 0.0005 GEN.");
-    const { hash } = await send(st, "Submitted. Waiting for the network to accept it…",
+    const { hash, finalized } = await send(st, "Submitted. Waiting for the network to accept it…",
       "file_attestation", [claim, rule, urls, settleby], stake);
     const count = Number(await read("get_attestation_count", []));
     const id = String(count - 1);
     const a = await readJSON("get_attestation", [id]);
     if (a.status === "OPEN" && a.claim === claim) {
-      setStatus(st, "ok", `Attestation #${id} filed and staked. Redirecting…`, hash);
+      if (finalized) setStatus(st, "ok", `Attestation #${id} filed and staked. Redirecting…`, hash);
+      else setStatus(st, "warn", `Attestation #${id} filed — finalization still pending on GenLayer. Redirecting…`, hash);
       setTimeout(() => (location.href = `/claim?id=${id}`), 1000);
     } else {
       const reason = await read("get_last_reject", [wallet.address]);
@@ -318,7 +331,7 @@ async function pageClaim() {
       <div class="k">Challenger</div><div class="v mono">${a.challenged ? `<a href="${addrUrl(a.challenger)}" target="_blank" rel="noopener">${esc(a.challenger)}</a> · bond ${genFmt(a.challenge_bond)}` : "none yet — open to an independent challenge"}</div>
       <div class="k">Settle by</div><div class="v">${whenTs(a.settle_by)}</div>
       <div class="k">Reviews run</div><div class="v">${a.review_count}</div>
-      ${a.settlement === "CREDITED" ? `<div class="k">Settled payout</div><div class="v">${genFmt(a.payout || a.stake)} → ${payoutWho(a)}${isSink(a.recipient) ? "" : " " + short(a.recipient)} <span class="pill">credited, pull via withdraw</span></div>` : ""}
+      ${a.settlement === "CREDITED" ? `<div class="k">Settled payout</div><div class="v">${genFmt(a.payout || a.stake)} → ${payoutWho(a)}${isSink(a.recipient) ? "" : " " + short(a.recipient)} <span class="pill">credited, pull via withdraw</span>${BigInt(a.slashed || 0) > 0n ? ` · <span class="pill bad">burned ${genFmt(a.slashed)}</span>` : ""}</div>` : ""}
     </div>
     <details class="ev"><summary>Source evidence (${a.source_urls.length} URL${a.source_urls.length > 1 ? "s" : ""})</summary>
       ${a.source_urls.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)} ↗</a>`).join("")}</details>
@@ -339,8 +352,9 @@ async function pageClaim() {
     try {
       await ensureReady();
       if (same(wallet.address, a.attester)) throw new Error("The attester cannot challenge their own claim.");
-      await send(st, "Posting your challenge bond…", "challenge_attestation", [id], BigInt(a.stake));
-      setStatus(st, "ok", "Challenge posted. Refreshing…");
+      const { hash, finalized } = await send(st, "Posting your challenge bond…", "challenge_attestation", [id], BigInt(a.stake));
+      if (finalized) setStatus(st, "ok", "Challenge posted. Refreshing…", hash);
+      else setStatus(st, "warn", "Challenge executed — finalization still pending. Refreshing…", hash);
       setTimeout(pageClaim, 1200);
     } catch (e) { setStatus(st, "err", e.message || String(e)); }
   };
@@ -348,8 +362,9 @@ async function pageClaim() {
 async function runWrite(st, fn, args, busyMsg, refresh, value = 0n) {
   try {
     await ensureReady();
-    const { hash } = await send(st, busyMsg, fn, args, value);
-    setStatus(st, "ok", "Done. Refreshing…", hash);
+    const { hash, finalized } = await send(st, busyMsg, fn, args, value);
+    if (finalized) setStatus(st, "ok", "Done and finalized. Refreshing…", hash);
+    else setStatus(st, "warn", "Executed — finalization still pending on GenLayer. Refreshing…", hash);
     setTimeout(refresh, 1000);
   } catch (e) { setStatus(st, "err", e.message || String(e)); }
 }

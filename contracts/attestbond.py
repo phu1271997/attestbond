@@ -15,19 +15,24 @@ from dataclasses import dataclass
 # Z") and stakes native GEN behind it. The claim carries a CHECK RULE, one to
 # three public SOURCE URLs and a SETTLE-BY deadline.
 #
-# ECONOMIC ACCOUNTABILITY (v0.2 — judge feedback).
-# The attester no longer names the challenger, so one person cannot run both
-# sides and recover a forfeited stake through a second wallet:
+# ECONOMIC ACCOUNTABILITY (v0.3 — judge feedback #2).
+# A REFUTED claim must cost the attester real value that NO wallet they control
+# can recover, even if that second wallet posts the challenge bond. So on every
+# refuted path the attester's ENTIRE stake is forfeited and a majority fraction
+# is burned to an unspendable sink:
 #   * Anyone INDEPENDENT may post a matching counter-bond with
 #     challenge_attestation() to become the challenger of record.
-#   * A claim judged REFUTED while CHALLENGED pays the attester's whole stake to
-#     the independent challenger (who also gets their bond back) - a real
-#     transfer of value to an adversary.
-#   * A claim judged REFUTED while UNCHALLENGED is SLASHED: the stake is burned
-#     to an unspendable sink, never returned, so refutation is always costly
-#     regardless of how many wallets the attester controls.
+#   * A claim judged REFUTED while CHALLENGED burns SLASH_BURN_BPS of the stake
+#     to the sink and pays only the remaining minority (the challenger bounty)
+#     plus the challenger's own bond back. The attester never gets the stake
+#     back, so even if the attester secretly owns the challenger wallet they are
+#     out-of-pocket the burned majority — self-dealing is strictly unprofitable.
+#   * A claim judged REFUTED while UNCHALLENGED burns the whole stake.
 #   * A claim judged SUPPORTED returns the stake to the attester and, if someone
 #     challenged, awards the loser's bond to the attester.
+# Worked example (SLASH_BURN_BPS = 6000, stake S, bond B = S): a self-dealing
+# attester stakes S and bonds S (2S committed). On REFUTED the challenger wallet
+# receives B + 0.4·S = 1.4·S and 0.6·S is burned, a guaranteed net loss of 0.6·S.
 #
 # JUDGMENT (GenLayer non-determinism).
 # Validators render the live sources on-chain and an LLM jury rules - strictly
@@ -62,6 +67,7 @@ MIN_SETTLE_WINDOW = 5 * 60              # settle-by must be >= now + 5 minutes
 MAX_SETTLE_WINDOW = 90 * 24 * 60 * 60   # ... and <= now + 90 days
 MAX_EVIDENCE = 12000                    # per-source char budget before truncation
 MIN_STAKE = 5 * 10 ** 14                # 0.0005 GEN - trivial claims are not free
+SLASH_BURN_BPS = 6000                   # fraction of a refuted stake burned even when challenged
 REJECTED = "REJECTED"
 SLASH_SINK = "0x" + ("0" * 38) + "dead" # unspendable burn sink for refuted stakes
 
@@ -143,6 +149,7 @@ class Attestation:
     evidence_fp: str           # fingerprint the last review's decision rested on
     sources_ok: bigint         # fully-read sources at the last review
     evidence_complete: bool    # all sources fully read (no empty/truncated)
+    slashed: bigint            # stake burned to the sink on a refuted verdict
 
 
 @allow_storage
@@ -321,16 +328,33 @@ Respond ONLY as JSON, no markdown:
         a.payout = amount
         self._credit(recipient, amount)
 
-    def _slash(self, att_id: str, a: Attestation, amount: bigint) -> None:
-        # Burn the stake to an unspendable sink: an unchallenged refutation is
-        # still costly, and no wallet the attester controls can recover it.
+    def _settle_refuted(self, att_id: str, a: Attestation) -> None:
+        # Every refuted path forfeits the attester's ENTIRE stake; a majority
+        # fraction is always burned to an unspendable sink. No wallet the
+        # attester controls - including the challenger wallet - can recover the
+        # burned portion, so a false claim is always a real net loss.
         if att_id in self.settled:
             return
         self.settled[att_id] = True
         a.settlement = "CREDITED"
-        a.recipient = SLASH_SINK
-        a.payout = amount
-        self.burned = self.burned + amount
+        stake = a.stake
+        if a.challenged:
+            # Burn the majority; pay the independent challenger the minority
+            # bounty plus their own bond back. The attester recovers none of the
+            # stake even if they secretly own the challenger wallet.
+            burn = stake * bigint(SLASH_BURN_BPS) // bigint(10000)
+            bounty = stake - burn
+            a.recipient = a.challenger
+            a.payout = a.challenge_bond + bounty
+            a.slashed = burn
+            self._credit(a.challenger, a.challenge_bond + bounty)
+        else:
+            # No challenger: the whole stake is burned.
+            burn = stake
+            a.recipient = SLASH_SINK
+            a.payout = bigint(0)
+            a.slashed = burn
+        self.burned = self.burned + burn
 
     def _fold_reputation(self, attester: str, target: int, supported: bool,
                          challenged_win: bool) -> None:
@@ -380,6 +404,7 @@ Respond ONLY as JSON, no markdown:
             settlement="LOCKED", recipient="0x" + ("0" * 40), payout=bigint(0),
             challenger="0x" + ("0" * 40), challenge_bond=bigint(0), challenged=False,
             evidence_fp="", sources_ok=bigint(0), evidence_complete=False,
+            slashed=bigint(0),
         )
         self.next_id = self.next_id + bigint(1)
         return aid
@@ -450,13 +475,8 @@ Respond ONLY as JSON, no markdown:
         elif verdict == "REFUTED":
             a.status = "REFUTED"
             a.resolved_at = bigint(now)
-            if a.challenged:
-                # independent challenger is made whole and takes the stake.
-                payout = a.stake + a.challenge_bond
-                self._credit_settlement(att_id, a, a.challenger, payout)
-            else:
-                # unchallenged refutation is slashed to the burn sink.
-                self._slash(att_id, a, a.stake)
+            # Entire stake forfeited; majority burned (challenged or not).
+            self._settle_refuted(att_id, a)
             self._fold_reputation(a.attester, 0, supported=False,
                                   challenged_win=False)
         # INCONCLUSIVE leaves the attestation OPEN for a later attempt.
@@ -517,6 +537,7 @@ Respond ONLY as JSON, no markdown:
             "reason": a.reason, "review_count": int(a.review_count),
             "resolved_at": int(a.resolved_at), "settlement": a.settlement,
             "recipient": a.recipient, "payout": str(a.payout),
+            "slashed": str(a.slashed),
             "evidence_fp": a.evidence_fp, "sources_ok": int(a.sources_ok),
             "evidence_complete": bool(a.evidence_complete),
         }
@@ -582,6 +603,7 @@ Respond ONLY as JSON, no markdown:
             "min_settle_window": MIN_SETTLE_WINDOW, "max_settle_window": MAX_SETTLE_WINDOW,
             "max_source_urls": MAX_URLS, "min_stake": str(MIN_STAKE),
             "rejected_marker": REJECTED, "slash_sink": SLASH_SINK,
+            "slash_burn_bps": SLASH_BURN_BPS,
             "total_burned": str(self.burned),
         })
 
